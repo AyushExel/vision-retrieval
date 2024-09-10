@@ -1,6 +1,8 @@
 import base64
 import io
 import os
+import pyarrow as pa
+import pandas as pd
 from typing import Optional
 
 import lancedb
@@ -70,16 +72,18 @@ def get_pdf_images(pdf_path):
 
 
 def get_model_colpali(base_model_id: Optional[str] = None):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = "vidore/colpali"
     if base_model_id is None:
         base_model_id = "google/paligemma-3b-mix-448"
-    model = ColPali.from_pretrained(base_model_id, torch_dtype=torch.bfloat16, device_map="cuda").eval()
+    model = ColPali.from_pretrained(base_model_id, torch_dtype=torch.bfloat16, device_map=device).eval()
     model.load_adapter(model_name)
     processor = AutoProcessor.from_pretrained(model_name)
     return model, processor
 
 
 def get_pdf_embedding(pdf_path: str, model, processor):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     page_images, page_texts = get_pdf_images(pdf_path=pdf_path)
     page_embeddings = []
     dataloader = DataLoader(
@@ -124,51 +128,97 @@ def get_query_embedding(query: str, model, processor):
     return q
 
 
-def embedd_docs(docs_path, model, processor):
+def embedd_docs(docs_path, model, processor, mode="batch"):
+    """
+    Returns embeddings for all pages in a document.
+
+    Args:
+        docs_path (str): Path to the PDF document.
+        model (ColPali): Model instance.
+        processor (AutoProcessor): Processor instance.
+        mode (str): Mode for embedding. Can be "batch" or "streaming".
+
+    """
     docs_to_store_pages = []
 
     for pdf_path in docs_path:
         print(pdf_path)
         pdf_doc = get_pdf_embedding(pdf_path=pdf_path, model=model, processor=processor)
         for page_idx in range(len(pdf_doc["page_images"])):
-            docs_to_store_pages.append(
-                {
-                    "name": pdf_doc["name"],
-                    "page_idx": page_idx,
-                    "page_image": pdf_doc["page_images"][page_idx],
-                    "page_text": pdf_doc["page_texts"][page_idx],
-                    "page_embedding": pdf_doc["page_embeddings"][page_idx],
-                }
-            )
-
-    return docs_to_store_pages
+            batch =  {
+                        "name": pdf_doc["name"],
+                        "page_idx": page_idx,
+                        "page_image": pdf_doc["page_images"][page_idx],
+                        "page_text": pdf_doc["page_texts"][page_idx],
+                        "page_embedding": pdf_doc["page_embeddings"][page_idx],
+                    }
+            if mode == "batch":
+                docs_to_store_pages.append(batch)
+            elif mode == "streaming":
+                yield batch
+        
+    if mode == "batch":
+        return docs_to_store_pages
 
 
 def create_db(docs_storage, table_name: str = "demo", db_path: str = "lancedb"):
+    batch = []
+    def _gen():
+        for x in docs_storage:
+            page_embedding_flatten = x["page_embedding"].float().numpy().flatten().tolist()
+            print(len(page_embedding_flatten))
+            if len(page_embedding_flatten) == 131840:
+                print("pass")
+            else:
+                raise ValueError("Embedding length is not 131840")
+            #yield pa.RecordBatch.from_arrays(
+            #    [
+            #        pa.array([x["name"]], pa.string()),
+            #        pa.array([x["page_text"]], pa.string()),
+            #        pa.array([get_base64_image(x["page_image"])], pa.string()),
+            #        pa.array([x["page_idx"]], pa.int64()),
+            #        pa.array([page_embedding_flatten], pa.list_(pa.float32(), 131840)),
+            #    ],
+            #    [
+            #        "name",
+            #        "page_text",
+            #        "image",
+            #        "page_idx",
+            #        "page_embedding_flatten"
+            #    ]
+            #)
+            yield [{
+                "name": x["name"],
+                "page_text": x["page_text"],
+                "image": get_base64_image(x["page_image"]),
+                "page_idx": x["page_idx"],
+                "vector": page_embedding_flatten,
+            }]
+        
+
     db = lancedb.connect(db_path)
-
-    data = []
-    for x in docs_storage:
-        sample = {
-            "name": x["name"],
-            "page_texts": x["page_text"],
-            "image": get_base64_image(x["page_image"]),
-            "page_idx": x["page_idx"],
-            "page_embedding_flatten": x["page_embedding"].float().numpy().flatten(),
-            "page_embedding_shape": x["page_embedding"].float().numpy().shape
-        }
-        data.append(sample)
-
-    table = db.create_table(table_name, data, mode="overwrite")
+    data = next(_gen())[0]
+    schema = pa.schema([
+                pa.field("name", pa.string()),
+                pa.field("page_text", pa.string()),
+                pa.field("image", pa.string()),
+                pa.field("page_idx", pa.int64()),
+                pa.field("vector", pa.list_(pa.float32(), len(data["vector"]))),
+            ])
+    data = _gen()
+    table = db.create_table(table_name, schema=schema, data=_gen(), mode="overwrite")
     return table
 
 
-def search(query: str, table_name: str, model, processor, db_path: str = "lancedb", top_k: int = 3):
+def search(query: str, table_name: str, model, processor, db_path: str = "lancedb", top_k: int = 3, fts=False, limit=None):
     qs = get_query_embedding(query=query, model=model, processor=processor)
     db = lancedb.connect(db_path)
     table = db.open_table(table_name)
     # Search over all dataset
-    r = table.search().limit(None).to_list()
+    if fts:
+        r = table.search(query, query_type="fts").limit(limit).to_list()
+    else:
+        r = table.search().limit(None).to_list() 
     
     def process_patch_embeddings(x):
         patches = np.reshape(x['page_embedding_flatten'], x['page_embedding_shape'])
@@ -196,7 +246,7 @@ def get_model_phi_vision(model_id: Optional[str] = None):
     # Note: set _attn_implementation='eager' if you don't have flash_attn installed
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        device_map="cuda",
+        device_map="cpu",
         trust_remote_code=True,
         torch_dtype="auto",
         # _attn_implementation='flash_attention_2'
