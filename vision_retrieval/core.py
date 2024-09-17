@@ -151,7 +151,7 @@ def embedd_docs(docs_path, model, processor):
         docs_path = [os.path.join(docs_path, doc) for doc in docs if not os.path.isdir(doc)]
 
     for pdf_path in docs_path:
-        if os.path.isdoc("pdf_path"):
+        if os.path.isdir("pdf_path"):
             print("skipping dir ", pdf_path)
             continue
         print(pdf_path)
