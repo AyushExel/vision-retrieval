@@ -17,6 +17,7 @@ from colpali_engine.utils.colpali_processing_utils import (
     process_images,
     process_queries,
 )
+from tqdm import tqdm
 from colpali_engine.utils.image_utils import get_base64_image
 from pdf2image import convert_from_path
 from pypdf import PdfReader
@@ -86,26 +87,30 @@ def get_pdf_embedding(pdf_path: str, model, processor):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     page_images, page_texts = get_pdf_images(pdf_path=pdf_path)
     page_embeddings = []
+    batch_size = 2
     dataloader = DataLoader(
         page_images,
         batch_size=2,
         shuffle=False,
         collate_fn=lambda x: process_images(processor, x),
     )
-
+    i = 0
     for batch_doc in tqdm(dataloader):
         with torch.no_grad():
             batch_doc = {k: v.to(model.device) for k, v in batch_doc.items()}
             embeddings_doc = model(**batch_doc)
-            page_embeddings.extend(list(torch.unbind(embeddings_doc.to("cpu"))))
-
-    document = {
-        "name": pdf_path,
-        "page_images": page_images,
-        "page_texts": page_texts,
-        "page_embeddings": page_embeddings,
-    }
-    return document
+        page_embeddings = list(torch.unbind(embeddings_doc.to("cpu")))
+        for page_embedding in page_embeddings:
+            document = {
+                "name": pdf_path,
+                "page_idx": i,
+                "page_image": page_images[i],
+                "page_text": page_texts[i],
+                "page_embedding": page_embedding,
+            }
+            i += 1
+        
+            yield document
 
 
 def get_query_embedding(query: str, model, processor):
@@ -128,7 +133,7 @@ def get_query_embedding(query: str, model, processor):
     return q
 
 
-def embedd_docs(docs_path, model, processor, mode="batch"):
+def embedd_docs(docs_path, model, processor):
     """
     Returns embeddings for all pages in a document.
 
@@ -140,25 +145,15 @@ def embedd_docs(docs_path, model, processor, mode="batch"):
 
     """
     docs_to_store_pages = []
+    if os.path.isdir(docs_path):
+        docs = os.listdir(docs_path)
+        docs_path = [os.path.join(docs_path, doc) for doc in docs if not os.path.isdir(doc)]
 
     for pdf_path in docs_path:
         print(pdf_path)
         pdf_doc = get_pdf_embedding(pdf_path=pdf_path, model=model, processor=processor)
-        for page_idx in range(len(pdf_doc["page_images"])):
-            batch =  {
-                        "name": pdf_doc["name"],
-                        "page_idx": page_idx,
-                        "page_image": pdf_doc["page_images"][page_idx],
-                        "page_text": pdf_doc["page_texts"][page_idx],
-                        "page_embedding": pdf_doc["page_embeddings"][page_idx],
-                    }
-            if mode == "batch":
-                docs_to_store_pages.append(batch)
-            elif mode == "streaming":
+        for batch in tqdm(pdf_doc):
                 yield batch
-        
-    if mode == "batch":
-        return docs_to_store_pages
 
 
 def create_db(docs_storage, table_name: str = "demo", db_path: str = "lancedb"):
@@ -166,11 +161,6 @@ def create_db(docs_storage, table_name: str = "demo", db_path: str = "lancedb"):
     def _gen():
         for x in docs_storage:
             page_embedding_flatten = x["page_embedding"].float().numpy().flatten().tolist()
-            print(len(page_embedding_flatten))
-            if len(page_embedding_flatten) == 131840:
-                print("pass")
-            else:
-                raise ValueError("Embedding length is not 131840")
             #yield pa.RecordBatch.from_arrays(
             #    [
             #        pa.array([x["name"]], pa.string()),
@@ -192,7 +182,8 @@ def create_db(docs_storage, table_name: str = "demo", db_path: str = "lancedb"):
                 "page_text": x["page_text"],
                 "image": get_base64_image(x["page_image"]),
                 "page_idx": x["page_idx"],
-                "vector": page_embedding_flatten,
+                "page_embedding_flatten": page_embedding_flatten,
+                "page_embedding_shape": list(x["page_embedding"].shape)
             }]
         
 
@@ -203,22 +194,67 @@ def create_db(docs_storage, table_name: str = "demo", db_path: str = "lancedb"):
                 pa.field("page_text", pa.string()),
                 pa.field("image", pa.string()),
                 pa.field("page_idx", pa.int64()),
-                pa.field("vector", pa.list_(pa.float32(), len(data["vector"]))),
+                pa.field("page_embedding_shape", pa.list_(pa.int64())),
+                pa.field("page_embedding_flatten", pa.list_(pa.float32(), len(data["page_embedding_flatten"]))),
             ])
     data = _gen()
     table = db.create_table(table_name, schema=schema, data=_gen(), mode="overwrite")
     return table
 
+def flatten_and_zero_pad(tensor, desired_length):
+    """Flattens a PyTorch tensor and zero-pads it to a desired length.
 
-def search(query: str, table_name: str, model, processor, db_path: str = "lancedb", top_k: int = 3, fts=False, limit=None):
+    Args:
+        tensor: The input PyTorch tensor.
+        desired_length: The desired length of the flattened tensor.
+
+    Returns:
+        The flattened and zero-padded tensor.
+    """
+
+    # Flatten the tensor
+    flattened_tensor = tensor.view(-1)
+
+    # Calculate the padding length
+    padding_length = desired_length - flattened_tensor.size(0)
+
+    # Check if padding is needed
+    if padding_length > 0:
+        # Zero-pad the tensor
+        padded_tensor = torch.cat([flattened_tensor, torch.zeros(padding_length, dtype=tensor.dtype)], dim=0)
+    else:
+        # Truncate the tensor if it's already too long
+        padded_tensor = flattened_tensor[:desired_length]
+
+    return padded_tensor
+
+
+def search(query: str, table_name: str, model, processor, db_path: str = "lancedb", top_k: int = 3, fts=False, vector=False, limit=None, where=None):
     qs = get_query_embedding(query=query, model=model, processor=processor)
     db = lancedb.connect(db_path)
     table = db.open_table(table_name)
+
+    try:
+        table.create_fts_index("page_text")
+    except Exception:
+        pass
     # Search over all dataset
+    if vector and fts:
+        raise ValueError("can't filter using both fts and vector")
+        
     if fts:
-        r = table.search(query, query_type="fts").limit(limit).to_list()
+        limit = limit or 100
+        r = table.search(query, query_type="fts").limit(limit)
+    elif vector:
+        limit = limit or 100
+        vec_q = flatten_and_zero_pad(qs["embeddings"],table.to_pandas()["page_embedding_flatten"][0].shape[0])
+        r = table.search(vec_q.float().numpy(), query_type="vector").limit(limit)
     else:
-        r = table.search().limit(None).to_list() 
+        r = table.search().limit(limit)
+    if where:
+        r = r.where(where)
+    
+    r = r.to_list()
     
     def process_patch_embeddings(x):
         patches = np.reshape(x['page_embedding_flatten'], x['page_embedding_shape'])
@@ -241,12 +277,13 @@ def search(query: str, table_name: str, model, processor, db_path: str = "lanced
 
 
 def get_model_phi_vision(model_id: Optional[str] = None):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     if model_id is None:
         model_id = "microsoft/Phi-3.5-vision-instruct"
     # Note: set _attn_implementation='eager' if you don't have flash_attn installed
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        device_map="cpu",
+        device_map=device,
         trust_remote_code=True,
         torch_dtype="auto",
         # _attn_implementation='flash_attention_2'
