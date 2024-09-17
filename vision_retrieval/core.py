@@ -114,6 +114,7 @@ def get_pdf_embedding(pdf_path: str, model, processor):
 
 
 def get_query_embedding(query: str, model, processor):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dummy_image = PIL.Image.new("RGB", (448, 448), (255, 255, 255))
     dataloader = DataLoader(
         [query],
@@ -150,6 +151,9 @@ def embedd_docs(docs_path, model, processor):
         docs_path = [os.path.join(docs_path, doc) for doc in docs if not os.path.isdir(doc)]
 
     for pdf_path in docs_path:
+        if os.path.isdoc("pdf_path"):
+            print("skipping dir ", pdf_path)
+            continue
         print(pdf_path)
         pdf_doc = get_pdf_embedding(pdf_path=pdf_path, model=model, processor=processor)
         for batch in tqdm(pdf_doc):
